@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_indirect_dev.mod := printf '%s\n'   wb_indirect_dev.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_indirect_dev.mod

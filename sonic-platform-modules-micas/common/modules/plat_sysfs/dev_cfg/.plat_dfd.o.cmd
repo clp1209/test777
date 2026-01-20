@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/plat_dfd.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/plat_dfd.o @/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/plat_dfd.mod 

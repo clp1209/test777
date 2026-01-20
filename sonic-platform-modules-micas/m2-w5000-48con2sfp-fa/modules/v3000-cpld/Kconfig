@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config WB_CPLD
+	tristate "WB CPLD driver via eSPI"
+	depends on ACPI && GPIOLIB && X86
+	help
+	  This driver provides access to CPLD devices on AMD-based platforms
+	  via eSPI Peripheral Channel. It supports two CPLD chips (CPU CPLD
+	  and CTRL CPLD) selected via GPIO-controlled chip select lines.
+
+	  The driver creates character device interfaces:
+	    /dev/cpld_cpu    - Binary register access
+	    /dev/cpld_ctrl   - Binary register access
+
+	  Userspace can use dd/pread/pwrite to access CPLD registers at
+	  arbitrary offsets for platform management and control.
+
+	  To compile this driver as a module, choose M here. The module
+	  will be called wb-cpld.
+
+	  If unsure, say N.

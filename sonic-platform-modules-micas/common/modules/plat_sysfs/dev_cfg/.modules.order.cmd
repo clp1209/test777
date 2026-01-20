@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/modules.order := {   echo /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/plat_dfd.ko; :; } > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_cfg/modules.order

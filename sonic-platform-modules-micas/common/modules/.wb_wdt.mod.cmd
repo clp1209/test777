@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_wdt.mod := printf '%s\n'   wb_wdt.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_wdt.mod

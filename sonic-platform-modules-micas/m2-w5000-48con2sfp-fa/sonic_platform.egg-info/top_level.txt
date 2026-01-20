@@ -1,0 +1,9 @@
+config
+eepromutil
+hal-config
+hal_pltfm
+plat_hal
+platform_intf
+platform_util
+sonic_platform
+wbutil

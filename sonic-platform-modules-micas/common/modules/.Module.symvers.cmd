@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/Module.symvers :=  sed 's/ko$$/o/'  /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/modules.order | scripts/mod/modpost -m      -o /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/Module.symvers -e -i Module.symvers -T - 

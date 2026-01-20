@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/fpga_i2c_ocores.mod := printf '%s\n'   fpga_i2c_ocores.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/fpga_i2c_ocores.mod

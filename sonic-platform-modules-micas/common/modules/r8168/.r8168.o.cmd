@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.o := ld -m elf_x86_64 -z noexecstack --no-warn-rwx-segments   -r -o /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.o @/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.mod 

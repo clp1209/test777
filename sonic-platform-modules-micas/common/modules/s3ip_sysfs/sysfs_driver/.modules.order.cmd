@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/sysfs_driver/modules.order := {   echo /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/sysfs_driver/s3ip_sysfs.ko; :; } > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/sysfs_driver/modules.order

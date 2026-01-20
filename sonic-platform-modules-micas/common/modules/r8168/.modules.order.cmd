@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/modules.order := {   echo /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.ko; :; } > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/modules.order

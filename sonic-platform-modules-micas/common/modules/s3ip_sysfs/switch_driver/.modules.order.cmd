@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/switch_driver/modules.order := {   echo /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/switch_driver/wb_switch_driver.ko; :; } > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/s3ip_sysfs/switch_driver/modules.order

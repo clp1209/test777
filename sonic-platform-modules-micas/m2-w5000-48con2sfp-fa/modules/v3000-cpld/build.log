@@ -1,0 +1,12 @@
+make -C /lib/modules/5.15.0-136-generic/build M=/home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld modules
+make[1]: Entering directory '/usr/src/linux-headers-5.15.0-136-generic'
+  CC [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000_cpld_espi.o
+  CC [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000_cpld_bus.o
+  CC [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000_cpld_dev.o
+  LD [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000-cpld.o
+  MODPOST /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/Module.symvers
+  CC [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000-cpld.mod.o
+  LD [M]  /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000-cpld.ko
+  BTF [M] /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000-cpld.ko
+Skipping BTF generation for /home/micasrd/data/clp/workspace/m2-5000/sonic-buildimage/platform/broadcom/sonic-platform-modules-micas/m2-w5000-48con2sfp-fa/modules/v3000-cpld/v3000-cpld.ko due to unavailability of vmlinux
+make[1]: Leaving directory '/usr/src/linux-headers-5.15.0-136-generic'

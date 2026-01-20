@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_platform_i2c_dev.mod := printf '%s\n'   wb_platform_i2c_dev.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_platform_i2c_dev.mod

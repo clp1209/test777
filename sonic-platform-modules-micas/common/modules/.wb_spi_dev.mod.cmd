@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_spi_dev.mod := printf '%s\n'   wb_spi_dev.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/wb_spi_dev.mod

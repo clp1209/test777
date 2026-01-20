@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Kbuild for out-of-tree module compilation
+#
+
+obj-m := wb-cpld.o
+
+wb-cpld-y := wb_cpld_espi.o \
+		wb_cpld_bus.o \
+		wb_cpld_dev.o
+
+# Kernel build system compatibility
+ccflags-y := -DCONFIG_WB_CPLD_MODULE
+
+# Default kernel source directory (override with KDIR=)
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+
+.PHONY: all clean install

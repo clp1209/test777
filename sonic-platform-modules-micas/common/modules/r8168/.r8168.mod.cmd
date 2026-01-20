@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.mod := printf '%s\n'   r8168_n.o r8168_asf.o rtl_eeprom.o rtltool.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/r8168/r8168.mod

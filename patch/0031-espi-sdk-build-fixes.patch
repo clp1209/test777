@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: micasrd <micasrd@example.com>
+Date: Tue, 7 Jan 2026 00:00:00 +0000
+Subject: [PATCH] spi: espi-amd: fix class_create() signature for 6.1
+
+Kernel 6.1 expects class_create() to be called with the module owner as the
+first argument. Adjust the vendor eSPI driver accordingly.
+
+This is an API compatibility fix only; no functional logic is changed.
+Keep any future vendor SDK build fixes in this patch.
+---
+ drivers/spi/espi-amd.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/spi/espi-amd.c b/drivers/spi/espi-amd.c
+index fa6cba754..aaaaaaaaa 100644
+--- a/drivers/spi/espi-amd.c
++++ b/drivers/spi/espi-amd.c
+@@ -2206,7 +2206,7 @@ static int amd_espi_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	amd_espi_dev_class = class_create("amd_espi");
++	amd_espi_dev_class = class_create(THIS_MODULE, "amd_espi");
+ 	if (IS_ERR(amd_espi_dev_class)) {
+ 		pr_err("AMD_ESPI: class_create faied\n");
+ 		ret = PTR_ERR(amd_espi_dev_class);

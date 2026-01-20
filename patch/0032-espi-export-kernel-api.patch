@@ -1,0 +1,256 @@
+diff --git a/drivers/spi/espi-amd.c b/drivers/spi/espi-amd.c
+index 9dac7532d..db26d9811 100644
+--- a/drivers/spi/espi-amd.c
++++ b/drivers/spi/espi-amd.c
+@@ -65,6 +65,15 @@ struct amd_espi {
+ 
+ static LIST_HEAD(device_list);
+ static DEFINE_MUTEX(device_list_lock);
++/*
++ * The vendor driver is primarily controlled via userspace ioctls. Some
++ * in-kernel consumers (e.g. CPLD drivers) may need a minimal API to:
++ *   - enable IO decode windows
++ *   - perform validated 8-bit IO accesses
++ *
++ * Serialize these exported helpers to avoid racing with configuration ioctls.
++ */
++static DEFINE_MUTEX(amd_espi_api_lock);
+ 
+ static struct class *amd_espi_dev_class;
+ static struct cdev cdev;
+@@ -1326,6 +1335,235 @@ static int espi_periph_mem_read(struct amd_espi *amd_espi, struct periph_mem_rw
+ 	return CB_SUCCESS;
+ }
+ 
++static struct amd_espi *amd_espi_get_first_locked(void)
++{
++	struct amd_espi *espi;
++
++	list_for_each_entry(espi, &device_list, device_entry) {
++		if (espi->dev)
++			return espi;
++	}
++
++	return NULL;
++}
++
++static bool amd_espi_range_covers(u16 base, u8 size_field, u16 port_first, u16 port_last)
++{
++	u16 last;
++
++	/*
++	 * The HW/programming model encodes IO range size in an 8-bit field.
++	 * The existing IO path validates the end as:
++	 *   port + len - 1 <= base + size_field
++	 * So size_field is effectively "last_offset".
++	 *
++	 * Keep the same semantics for coverage checks here.
++	 */
++	last = base + size_field;
++
++	return port_first >= base && port_last <= last;
++}
++
++/*
++ * Minimal in-kernel API
++ *
++ * NOTE: These helpers currently rely on the controller's IO/MMIO decode
++ * mechanism. They are intended to keep other kernel drivers from duplicating
++ * decode-range programming and validation logic.
++ *
++ * TODO: If the platform later requires "direct" Peripheral Channel
++ *       transactions (without CPU IO/MMIO decode), add a dedicated
++ *       PERIPHERAL_CHNL downstream transaction path here.
++ */
++int amd_espi_enable_io_decode(u16 base, u16 size)
++{
++	struct amd_espi *amd_espi;
++	struct io_mmio_decode_config cfg;
++
++	if (!size)
++		return -EINVAL;
++
++	/*
++	 * IO range size is stored in an 8-bit field. Keep the encoding aligned
++	 * with the existing range checks in espi_periph_io_{read,write}().
++	 *
++	 * TODO: Confirm whether the HW expects "size-1" or "size" encoding.
++	 */
++	if (size - 1 > 0xff)
++		return -EINVAL;
++
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.io_mmio_dc_enable = IO_DECODE_RANGE0;
++	cfg.range0.base_addr_range0 = base;
++	cfg.range2.io_range0_size = size - 1;
++
++	mutex_lock(&device_list_lock);
++	amd_espi = amd_espi_get_first_locked();
++	if (!amd_espi) {
++		mutex_unlock(&device_list_lock);
++		return -ENODEV;
++	}
++
++	mutex_lock(&amd_espi_api_lock);
++	espi_set_io_mmio_decode_config(amd_espi, &cfg);
++	mutex_unlock(&amd_espi_api_lock);
++
++	mutex_unlock(&device_list_lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_espi_enable_io_decode);
++
++int amd_espi_get_io_decode_range(unsigned int idx, u16 *base, u8 *size_field, bool *enabled)
++{
++	struct amd_espi *amd_espi;
++	struct io_mmio_decode_config cfg;
++	u16 b = 0;
++	u8 s = 0;
++	bool en = false;
++
++	if (!base || !size_field || !enabled)
++		return -EINVAL;
++
++	if (idx > 3)
++		return -EINVAL;
++
++	mutex_lock(&device_list_lock);
++	amd_espi = amd_espi_get_first_locked();
++	if (!amd_espi) {
++		mutex_unlock(&device_list_lock);
++		return -ENODEV;
++	}
++
++	mutex_lock(&amd_espi_api_lock);
++	espi_get_io_mmio_decode_info(amd_espi, &cfg);
++	mutex_unlock(&amd_espi_api_lock);
++	mutex_unlock(&device_list_lock);
++
++	switch (idx) {
++	case 0:
++		b = cfg.range0.base_addr_range0;
++		s = cfg.range2.io_range0_size;
++		en = !!(cfg.io_mmio_dc_enable & IO_DECODE_RANGE0);
++		break;
++	case 1:
++		b = cfg.range0.base_addr_range1;
++		s = cfg.range2.io_range1_size;
++		en = !!(cfg.io_mmio_dc_enable & IO_DECODE_RANGE1);
++		break;
++	case 2:
++		b = cfg.range1.base_addr_range2;
++		s = cfg.range2.io_range2_size;
++		en = !!(cfg.io_mmio_dc_enable & IO_DECODE_RANGE2);
++		break;
++	case 3:
++		b = cfg.range1.base_addr_range3;
++		s = cfg.range2.io_range3_size;
++		en = !!(cfg.io_mmio_dc_enable & IO_DECODE_RANGE3);
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	*base = b;
++	*size_field = s;
++	*enabled = en;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_espi_get_io_decode_range);
++
++int amd_espi_io_decode_covers(u16 base, u16 size)
++{
++	unsigned int i;
++	u16 port_first, port_last;
++
++	if (!size)
++		return -EINVAL;
++
++	port_first = base;
++	port_last = base + size - 1;
++
++	for (i = 0; i < 4; i++) {
++		u16 rb;
++		u8 rs;
++		bool en;
++		int ret;
++
++		ret = amd_espi_get_io_decode_range(i, &rb, &rs, &en);
++		if (ret)
++			return ret;
++		if (!en)
++			continue;
++		if (amd_espi_range_covers(rb, rs, port_first, port_last))
++			return 1;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_espi_io_decode_covers);
++
++int amd_espi_io_read8(u16 port, u8 *val)
++{
++	struct amd_espi *amd_espi;
++	struct periph_io_rw msg;
++	int ret;
++
++	if (!val)
++		return -EINVAL;
++
++	memset(&msg, 0, sizeof(msg));
++	msg.len = 1;
++	msg.port = port;
++
++	mutex_lock(&device_list_lock);
++	amd_espi = amd_espi_get_first_locked();
++	if (!amd_espi) {
++		mutex_unlock(&device_list_lock);
++		return -ENODEV;
++	}
++
++	mutex_lock(&amd_espi_api_lock);
++	ret = espi_periph_io_read(amd_espi, &msg);
++	mutex_unlock(&amd_espi_api_lock);
++	mutex_unlock(&device_list_lock);
++
++	if (ret != CB_SUCCESS)
++		return -EIO;
++
++	*val = msg.data.data_b;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_espi_io_read8);
++
++int amd_espi_io_write8(u16 port, u8 val)
++{
++	struct amd_espi *amd_espi;
++	struct periph_io_rw msg;
++	int ret;
++
++	memset(&msg, 0, sizeof(msg));
++	msg.len = 1;
++	msg.port = port;
++	msg.data.data_b = val;
++
++	mutex_lock(&device_list_lock);
++	amd_espi = amd_espi_get_first_locked();
++	if (!amd_espi) {
++		mutex_unlock(&device_list_lock);
++		return -ENODEV;
++	}
++
++	mutex_lock(&amd_espi_api_lock);
++	ret = espi_periph_io_write(amd_espi, &msg);
++	mutex_unlock(&amd_espi_api_lock);
++	mutex_unlock(&device_list_lock);
++
++	if (ret != CB_SUCCESS)
++		return -EIO;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amd_espi_io_write8);
++
+ static int set_espi_intr_config(struct amd_espi *amd_espi, unsigned int config)
+ {
+ 	writel(config, (ESPI_BASE + ESPI_SLAVE0_INT_EN));

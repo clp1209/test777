@@ -1,0 +1,21 @@
+Metadata-Version: 2.1
+Name: sonic-platform
+Version: 1.0
+Summary: SONiC platform API implementation
+Home-page: 
+Author: SONiC Team
+Author-email: support
+Maintainer: support
+Maintainer-email: 
+License: Apache 2.0
+Keywords: sonic SONiC platform PLATFORM
+Classifier: Development Status :: 3 - Alpha
+Classifier: Environment :: Plugins
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: Intended Audience :: System Administrators
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Natural Language :: English
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Topic :: Utilities

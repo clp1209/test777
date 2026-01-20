@@ -1,0 +1,1840 @@
+From 20533e9bd22a3d5ff793bae9a70611d8b71e07a2 Mon Sep 17 00:00:00 2001
+From: Ramesh Garidapuri <ramesh.garidapuri@amd.com>
+Date: Mon, 9 Oct 2023 16:38:54 +0530
+Subject: [PATCH 17/33] eSPI release-1 for v3000
+
+    Supported features:
+    1. Channel independent commands except in-band reset.
+    2. PC channel IOWRITE and IOREAD.
+
+    Signed-off-by: Akshata MukundShetty <akshata.mukundshetty@amd.com>
+
+Change-Id: I950c8371b559b83b34d9d66e5f3acfc26ad35fb4
+---
+ drivers/spi/Kconfig      |    5 +
+ drivers/spi/Makefile     |    1 +
+ drivers/spi/espi-amd.c   | 1389 ++++++++++++++++++++++++++++++++++++++
+ drivers/spi/espi.h       |  276 ++++++++
+ drivers/spi/espi_slave.h |  103 +++
+ 5 files changed, 1774 insertions(+)
+ create mode 100644 drivers/spi/espi-amd.c
+ create mode 100644 drivers/spi/espi.h
+ create mode 100644 drivers/spi/espi_slave.h
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index 3ce0fd5df..cd097e139 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -1176,6 +1176,11 @@ config SPI_AMD
+ 	help
+ 	  Enables SPI controller driver for AMD SoC.
+ 
++config ESPI_AMD
++        tristate "AMD eSPI controller"
++        help
++          Enables eSPI controller driver for AMD SoC.
++
+ #
+ # Add new SPI master controllers in alphabetical order above this line
+ #
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index 6af54842b..5be8d66c0 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -152,6 +152,7 @@ obj-$(CONFIG_SPI_XTENSA_XTFPGA)		+= spi-xtensa-xtfpga.o
+ obj-$(CONFIG_SPI_ZYNQ_QSPI)		+= spi-zynq-qspi.o
+ obj-$(CONFIG_SPI_ZYNQMP_GQSPI)		+= spi-zynqmp-gqspi.o
+ obj-$(CONFIG_SPI_AMD)			+= spi-amd.o
++obj-$(CONFIG_ESPI_AMD)			+= espi-amd.o
+ 
+ # SPI slave protocol handlers
+ obj-$(CONFIG_SPI_SLAVE_TIME)		+= spi-slave-time.o
+diff --git a/drivers/spi/espi-amd.c b/drivers/spi/espi-amd.c
+new file mode 100644
+index 000000000..4774c0b4c
+--- /dev/null
++++ b/drivers/spi/espi-amd.c
+@@ -0,0 +1,1389 @@
++#include <linux/acpi.h>
++#include <linux/init.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/platform_device.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/device.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/errno.h>
++#include <linux/cdev.h>
++#include <linux/jiffies.h>
++#include <linux/delay.h>
++#include <linux/timer.h>
++#include <asm/uaccess.h>
++#include <linux/slab.h>
++#include "espi.h"
++#include "espi_slave.h"
++
++#define ESPI_DEV_MINORS		0
++#define N_ESPI_MINORS           1
++
++#define ESPI_CH_READY_TIMEOUT_US		10000
++
++/*
++ * In case of get configuration command, hdata0 contains bits 15:8 of the slave register address
++ * and hdata1 contains bits 7:0 of the slave register address.
++ */
++#define ESPI_CONFIGURATION_HDATA0(a)		(((a) >> 8) & 0xff)
++#define ESPI_CONFIGURATION_HDATA1(a)		((a) & 0xff)
++
++enum amd_espi_versions {
++	AMD_ESPI_V1 = 1,     /* AMDI0070 */
++};
++
++int espi_channel = 0;	//PC channel
++int espi_io_mode = 0;	//Single IO MODE
++int espi_op_freq = 16;	//16MHz
++
++
++struct amd_espi {
++	void __iomem *io_remap_addr;
++	unsigned long io_base_addr;
++	enum amd_espi_versions version;
++	struct device          *dev;
++	struct espi_master	*master;
++	dev_t                  dev_minor;
++	spinlock_t             espi_lock;
++	struct list_head       device_entry;
++	unsigned		   users;
++};
++
++static LIST_HEAD(device_list);
++static DEFINE_MUTEX(device_list_lock);
++
++static struct class *amd_espi_dev_class;
++static struct cdev cdev;
++dev_t dev_minor;
++
++static inline u32 amd_espi_readreg32(struct amd_espi *amd_espi, int idx)
++{
++	return ioread32((u8 __iomem *)amd_espi->io_remap_addr + idx); 
++}
++
++static inline void amd_espi_writereg32(struct amd_espi *amd_espi, int idx, u32 val)
++{
++	iowrite32(val, ((u8 __iomem *)amd_espi->io_remap_addr + idx));
++}
++
++void timer_callback(struct timer_list *timer)
++{
++	pr_info("AMD_ESPI: timer call back\n");
++}
++
++static int espi_ready_wait(struct amd_espi *amd_espi)
++{
++	union espi_txhdr0 hdr0;
++	unsigned int iter = 0;
++
++	while (iter < 8)
++	{
++		hdr0.val = amd_espi_readreg32(amd_espi, AMD_ESPI_DS_HEADER_REG0);
++		if (!hdr0.cmd_status) {
++			return CB_SUCCESS;
++		}
++		msleep(20);
++		iter++;
++	}
++
++	return CB_ERR;
++}
++
++static void espi_clear_status(struct amd_espi *amd_espi)
++{
++	uint32_t status = amd_espi_readreg32(amd_espi, ESPI_SLAVE0_INT_STS);
++	if (status)
++		amd_espi_writereg32(amd_espi, ESPI_SLAVE0_INT_STS, status);
++}
++
++static int espi_poll_status(struct amd_espi *amd_espi, u32 *status)
++{
++	int iter = 0;
++
++	while (iter < 8)
++	{
++		*status = amd_espi_readreg32(amd_espi, ESPI_SLAVE0_INT_STS);
++		if (*status) {
++			return CB_SUCCESS;
++		}
++		msleep(20);
++		iter++;
++	}
++
++	return CB_ERR;
++}
++
++static int espi_send_cmd(struct amd_espi *amd_espi, struct espi_txcmd *cmd)
++{
++	u32 status;
++	u32 command_status = 0;
++
++	if (espi_ready_wait(amd_espi) != CB_SUCCESS)
++	{
++		pr_err("AMD_ESPI: %s, espi_ready_wait failed, before write\n", __func__);
++		pr_err("AMD_ESPI: eSPI cmd0-cmd2: %08x %08x %08x data: %08x.\n",
++				cmd->hdr0.val, cmd->hdr1.val, cmd->hdr2.val, cmd->data.val);
++		pr_err("AMD_ESPI: Error: eSPI was not ready to accept a command (Status = 0x%x)\n", status);
++		return CB_ERR;
++	}
++	espi_clear_status(amd_espi);
++
++	amd_espi_writereg32(amd_espi, AMD_ESPI_DS_HEADER_REG1, cmd->hdr1.val);
++	amd_espi_writereg32(amd_espi, AMD_ESPI_DS_HEADER_REG2, cmd->hdr2.val);
++	amd_espi_writereg32(amd_espi, AMD_ESPI_DS_DATA_REG0, cmd->data.val);
++
++	amd_espi_writereg32(amd_espi, AMD_ESPI_DS_HEADER_REG0, cmd->hdr0.val);
++
++	command_status = amd_espi_readreg32(amd_espi, AMD_ESPI_DS_HEADER_REG0);
++	if (espi_ready_wait(amd_espi) != CB_SUCCESS){
++		pr_err("AMD_ESPI: %s, espi_ready_wait failed, after write\n", __func__);
++		pr_err("AMD_ESPI: eSPI cmd0-cmd2: %08x %08x %08x data: %08x.\n",
++				cmd->hdr0.val, cmd->hdr1.val, cmd->hdr2.val, cmd->data.val);
++		pr_err("AMD_ESPI: Error: eSPI timed out waiting for command to complete (Status = 0x%x)\n", status);
++		return CB_ERR;
++	}
++	if (espi_poll_status(amd_espi, &status) != CB_SUCCESS){
++		pr_err("AMD_ESPI: %s, espi_poll_status failed, after write\n", __func__);
++		pr_err("AMD_ESPI: eSPI cmd0-cmd2: %08x %08x %08x data: %08x.\n",
++				cmd->hdr0.val, cmd->hdr1.val, cmd->hdr2.val, cmd->data.val);
++		pr_err("AMD_ESPI: Error: eSPI poll status failed (Status = 0x%x)\n", status);
++		return CB_ERR;
++	}
++
++	/* If command did not complete downstream, return error. */
++	if (!(status & ESPI_STATUS_DNCMD_COMPLETE)) {
++		pr_err("AMD_ESPI: eSPI downstream command completion failure\n");
++		return CB_ERR;
++	}
++
++	if (status & ~(ESPI_STATUS_DNCMD_COMPLETE | cmd->expected_status_codes)) {
++		pr_err("AMD_ESPI: %s, unexpected status code from slave\n", __func__);
++		pr_err("AMD_ESPI: eSPI cmd0-cmd2: %08x %08x %08x data: %08x.\n",
++				cmd->hdr0.val, cmd->hdr1.val, cmd->hdr2.val, cmd->data.val);
++		pr_err("AMD_ESPI: Error: unexpected eSPI status register bits set (Status = 0x%x)\n", status);
++		return CB_ERR;
++	}
++
++	command_status = amd_espi_readreg32(amd_espi, AMD_ESPI_DS_HEADER_REG0);
++	return CB_SUCCESS;
++}
++
++
++static int amd_espi_inband_reset(struct amd_espi *amd_espi)
++{
++	struct espi_txcmd cmd = {
++		.hdr0 = {
++			.cmd_type = IN_BAND_RESET,
++			.cmd_status = 1,
++		},
++	};
++
++	return espi_send_cmd(amd_espi, &cmd);
++}
++
++/*Set Slave config and cap reg vals*/
++static u32 amd_espi_setIoMode(struct amd_espi *amd_espi, u32 *slave_config,u32 *ctrlr_config, u32 io_mode)
++{
++	struct espi_master *master = amd_espi->master;
++
++	switch(io_mode){
++		case IO_MODE_QUAD:
++			if (master->caps.io_mode_quad &&
++					espi_slave_supports_quad_io(*slave_config)) {
++				*ctrlr_config = (* ctrlr_config & ~(3 << 28)) | (IO_MODE_QUAD << 28);
++				*slave_config = (*slave_config & ESPI_SLAVE_IO_MODE_SEL_MASK) | ESPI_SLAVE_IO_MODE_SEL_QUAD;
++				break;
++			}
++			pr_info("AMD_ESPI: eSPI Quad I/O not supported. Dropping to dual mode.\n");
++			fallthrough;
++		case IO_MODE_DUAL:
++			if (master->caps.io_mode_dual &&
++					espi_slave_supports_dual_io(*slave_config)) {
++				*ctrlr_config = (* ctrlr_config & ~(3 << 28)) | (IO_MODE_DUAL << 28);
++				*slave_config = (*slave_config & ESPI_SLAVE_IO_MODE_SEL_MASK) | ESPI_SLAVE_IO_MODE_SEL_DUAL;
++				break;
++			}
++			pr_info("AMD_ESPI: eSPI Dual I/O not supported. Dropping to single mode.\n");
++			fallthrough;
++		case IO_MODE_SINGLE:
++		default:
++			if (master->caps.io_mode_single &&
++					espi_slave_supports_single_io(*slave_config)) {
++				*ctrlr_config = (* ctrlr_config & ~(3 << 28)) | (IO_MODE_SINGLE << 28);
++				*slave_config = (*slave_config & ESPI_SLAVE_IO_MODE_SEL_MASK) | ESPI_SLAVE_IO_MODE_SEL_SINGLE;
++			} else {
++				pr_info("AMD_ESPI: %s, eSPI iomode not supported\n", __func__);
++			}
++			break;
++	}
++
++	return CB_SUCCESS;
++}
++
++static u32 amd_espi_setOpFreqMode(struct amd_espi* amd_espi, u32 *slave_config,u32 *ctrlr_config, u32 op_freq)
++{
++	struct espi_master *master = amd_espi->master;
++
++	switch(op_freq){
++		case SLAVE_OP_FREQ_66:
++			if (master->caps.op_freq_66 &&
++					espi_slave_supports_66_mhz(*slave_config)) {
++				*ctrlr_config = (* ctrlr_config & ~(7 << 25)) | (CNTRL_SLAVE0_OP_FREQ_66 << 25);
++				*slave_config = (*slave_config & ESPI_SLAVE_OP_FREQ_SEL_MASK) | ESPI_SLAVE_OP_FREQ_SEL_66_MHZ;
++				break;
++			}
++			pr_info("AMD_ESPI: eSPI frequency 66 MHz not supported. Dropping to 33MHz.\n");
++			fallthrough;
++		case SLAVE_OP_FREQ_33:
++			if (master->caps.op_freq_33 &&
++					 ((espi_slave_supports_66_mhz(*slave_config)) ||
++                                        (espi_slave_supports_33_mhz(*slave_config)))) {
++				*ctrlr_config = (* ctrlr_config & ~(7 << 25)) | (CNTRL_SLAVE0_OP_FREQ_33 << 25);
++				*slave_config = (*slave_config & ESPI_SLAVE_OP_FREQ_SEL_MASK) | ESPI_SLAVE_OP_FREQ_SEL_33_MHZ;
++				break;
++			}
++			pr_info("AMD_ESPI: eSPI frequency 33 MHz not supported. Dropping to 16MHz.\n");
++			fallthrough;
++		case SLAVE_OP_FREQ_16:
++		default:
++			if (master->caps.op_freq_16 &&
++					 ((espi_slave_supports_66_mhz(*slave_config)) ||
++                                        (espi_slave_supports_33_mhz(*slave_config)) ||
++                                        (espi_slave_supports_16_mhz(*slave_config)))) {
++				*ctrlr_config = (* ctrlr_config & ~(7 << 25)) | (CNTRL_SLAVE0_OP_FREQ_16 << 25);
++				*slave_config = (*slave_config & ESPI_SLAVE_OP_FREQ_SEL_MASK) | ESPI_SLAVE_OP_FREQ_SEL_16_MHZ;
++			} else {
++				pr_err("AMD_ESPI: %s, eSPI frequency mode not supported\n", __func__);
++				return CB_ERR;
++			}
++			break;
++	}
++	return CB_SUCCESS;
++}
++
++static u32 amd_espi_GetConfig(struct amd_espi* amd_espi, u16 slave_reg_address, u32 *config)
++{
++	struct espi_txcmd cmd = {
++		.hdr0 = {
++			.cmd_type = GET_CONFIGURATION,
++			.cmd_status = 1,
++			.hdata0 = ESPI_CONFIGURATION_HDATA0(slave_reg_address),
++			.hdata1 = ESPI_CONFIGURATION_HDATA1(slave_reg_address),
++		},
++	};
++
++	if (espi_send_cmd(amd_espi, &cmd) != CB_SUCCESS) {
++		return CB_ERR;
++	}
++
++	*config = amd_espi_readreg32(amd_espi, AMD_ESPI_DS_HEADER_REG1);
++
++	return CB_SUCCESS;
++}
++
++static int amd_espi_chenbl_info(struct amd_espi *amd_espi)
++{   
++	u32 chnl_config;
++        u32 ret = 0;
++
++        if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_PERIPH_CFG, &chnl_config) != CB_ERR){
++                if (chnl_config & ESPI_SLAVE_CHANNEL_ENABLE)
++                        ret |= CHANNEL_MODE_PC;
++        }
++        if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_VW_CFG, &chnl_config) != CB_ERR){
++                if (chnl_config & ESPI_SLAVE_CHANNEL_ENABLE)
++                        ret |= CHANNEL_MODE_VW;
++        }
++        if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_OOB_CFG, &chnl_config) != CB_ERR){
++                if (chnl_config & ESPI_SLAVE_CHANNEL_ENABLE)
++                        ret |= CHANNEL_MODE_OOB;
++        }
++        if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_FLASH_CFG, &chnl_config) != CB_ERR){
++                if (chnl_config & ESPI_SLAVE_CHANNEL_ENABLE)
++                        ret |= CHANNEL_MODE_FLASH;
++        }
++
++        if (ret == 0)
++                return CB_ERR;
++
++        return ret;
++}
++
++static int amd_espi_Get_General_Config(struct amd_espi* amd_espi, u32 *config)
++{
++	if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_GENERAL_CAPS_CFG, config) != CB_SUCCESS) {
++		return CB_ERR;
++	}
++
++	return CB_SUCCESS;
++}
++
++static int amd_espi_SetConfig(struct amd_espi* amd_espi, u32 config, u16 slave_reg_address)
++{
++	struct espi_txcmd cmd = {
++		.hdr0 = {
++			.cmd_type = SET_CONFIGURATION,
++			.cmd_status = 1,
++			.hdata0 = ESPI_CONFIGURATION_HDATA0(slave_reg_address),
++			.hdata1 = ESPI_CONFIGURATION_HDATA1(slave_reg_address),
++		},
++		.hdr1 = {
++			.val = config,
++		},
++	};
++
++	return espi_send_cmd(amd_espi, &cmd);
++}
++
++static int amd_espi_Set_General_Config(struct amd_espi* amd_espi, struct espi_device* dev)
++{
++	int status = 0;
++	u32 slave_config = 0;
++	u32 ctrlr_config = amd_espi_readreg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG);
++
++	if (amd_espi_Get_General_Config(amd_espi, &slave_config) != CB_SUCCESS) {
++		return CB_ERR;
++	}
++
++	status = amd_espi_setIoMode(amd_espi, &slave_config, &ctrlr_config, dev->io_mode);
++	if (status != CB_SUCCESS)
++	{
++		pr_err("AMD_ESPI: %s, Error: IO mode not supported\n", __func__);
++		return -ENOTSUPP;
++	}
++
++	status = amd_espi_setOpFreqMode(amd_espi, &slave_config, &ctrlr_config, dev->op_freq);
++	if (status != CB_SUCCESS)
++	{
++		pr_err("AMD_ESPI: %s, Error: op freq not supported\n", __func__);
++		return-ENOTSUPP;
++	}
++
++	status = amd_espi_SetConfig(amd_espi, slave_config, ESPI_SLAVE_GENERAL_CAPS_CFG);
++
++	if (status != CB_SUCCESS)
++	{
++		return CB_ERR;
++	}
++
++	amd_espi_writereg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG, ctrlr_config);
++	return CB_SUCCESS;
++}
++
++static u32 amd_espi_wait_channel_ready(struct amd_espi *amd_espi, u32 slave_reg_addr)
++{
++	struct timer_list timer;
++	u32 config;
++
++	timer_setup(&timer, timer_callback, 0);
++	timer.expires = jiffies + (HZ / 10);	
++	add_timer(&timer);
++	do {	
++		if (amd_espi_GetConfig(amd_espi, slave_reg_addr, &config) != CB_SUCCESS) {
++			return CB_ERR;
++		}
++		if (!!(config & ESPI_SLAVE_CHANNEL_READY))
++			return CB_SUCCESS;
++		msleep(20);
++	} while (timer_pending(&timer));
++
++	pr_err("AMD_ESPI: %s, Channel is not ready after %d usec (slave addr: 0x%x)\n", __func__,
++			ESPI_CH_READY_TIMEOUT_US, slave_reg_addr);
++
++	return CB_ERR;
++
++}
++
++static void amd_espi_enable_ctrlr_channel(struct amd_espi *amd_espi, u32 channel_en)
++{
++	u32 reg = amd_espi_readreg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG);
++
++	reg |= channel_en;
++	amd_espi_writereg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG, reg);
++}
++
++static u32 amd_espi_set_channel_configuration(struct amd_espi *amd_espi,u32 slave_config,
++		u32 slave_reg_addr,
++		u32 ctrlr_enable)
++{
++	if (amd_espi_SetConfig(amd_espi, slave_config, slave_reg_addr) != CB_SUCCESS) { //set slave's peripheral channel
++		pr_err("AMD_ESPI:Channel: %s, set peripheral channel returing error\n", __func__);
++		return CB_ERR;
++	}
++
++	if (!(slave_config & ESPI_SLAVE_CHANNEL_ENABLE)) //Channel ENABLE 
++		return CB_SUCCESS;
++
++	if (amd_espi_wait_channel_ready(amd_espi, slave_reg_addr) != CB_SUCCESS) {//Channel Ready
++		pr_err("AMD_ESPI:Channel: %s, channel_ready returing error\n", __func__);
++		return CB_ERR;
++	}
++
++	amd_espi_enable_ctrlr_channel(amd_espi, ctrlr_enable); //On the master side set peripheral channel
++	return CB_SUCCESS;
++}
++
++static u32 amd_espi_setup_periph_channel(struct amd_espi *amd_espi, u32 slave_caps)
++{
++	struct espi_master *master = amd_espi->master;
++	u32 slave_config;
++	/* Peripheral channel requires BME bit to be set when enabling the channel. */
++	const u32 slave_en_mask =
++		ESPI_SLAVE_CHANNEL_ENABLE | ESPI_SLAVE_PERIPH_BUS_MASTER_ENABLE;
++
++
++	if (amd_espi_GetConfig(amd_espi, ESPI_SLAVE_PERIPH_CFG, &slave_config) != CB_SUCCESS) {
++		return CB_ERR;
++	}
++
++	/* Check if PC is already enabled. If yes, return success */
++	if (slave_config & ESPI_SLAVE_CHANNEL_ENABLE){
++		return CB_SUCCESS;
++	} 
++
++
++	/*
++	 * Peripheral channel is the only one which is enabled on reset. So, if the mainboard
++	 * wants to disable it, set configuration to disable peripheral channel. It also
++	 * requires that BME bit be cleared.
++	 */
++
++	if (master->caps.periph_ch_en) {
++		if (!(slave_caps & ESPI_SLAVE_PERIPH_CH_SUPP)) {
++			pr_err("AMD_ESPI:Channel: eSPI slave doesn't support periph channel!\n");
++			return CB_ERR;
++		}
++		slave_config |= slave_en_mask;
++	} else {
++		slave_config &= ~slave_en_mask; // if master does not support make it 0
++	}
++
++	return amd_espi_set_channel_configuration(amd_espi, slave_config, ESPI_SLAVE_PERIPH_CFG,
++			CHANNEL_MODE_PC);
++}
++
++
++static void espi_get_io_mmio_decode_info(struct amd_espi *amd_espi, struct io_mmio_decode_config *config)
++{
++	config->io_mmio_dc_enable = amd_espi_readreg32(amd_espi, ESPI_IO_MMIO_DECODE_EN_REG);
++	config->range0.val = amd_espi_readreg32(amd_espi, ESPI_TARGET_RANGE_REG0);
++	config->range1.val = amd_espi_readreg32(amd_espi, ESPI_TARGET_RANGE_REG1);
++	config->range2.val = amd_espi_readreg32(amd_espi, ESPI_TARGET_RANGE_REG2);
++}
++
++static int espi_periph_io_write(struct amd_espi* amd_espi, struct periph_io_rw *message_io)
++{
++	struct io_mmio_decode_config io_config;    
++    	espi_get_io_mmio_decode_info(amd_espi, &io_config);
++    
++    	/*Check if port address is valid and if the range is enabled*/
++    	if (message_io->port == io_config.range0.base_addr_range0) {    
++		if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE0))
++		{
++			pr_err("AMD_ESPI: IO range0 not enabled for port address: 0x%x\n", message_io->port);
++			return CB_ERR;
++        	}
++	}
++    	else if(message_io->port == io_config.range0.base_addr_range1) {
++        	if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE1))
++        	{
++            		pr_err("AMD_ESPI: IO range1 not enabled for port address: 0x%x\n", message_io->port);
++            		return CB_ERR;
++        	}
++    	}
++    	else if(message_io->port == io_config.range1.base_addr_range2) {
++        	if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE2))
++        	{
++            		pr_err("AMD_ESPI: IO range2 not enabled for port address: 0x%x\n", message_io->port);
++            		return CB_ERR;
++        	}
++    	}
++    	else if(message_io->port == io_config.range1.base_addr_range3) {
++        	if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE3))
++        	{
++            		pr_err("AMD_ESPI: IO range1 not enabled for port address: 0x%x\n", message_io->port);
++            		return CB_ERR;
++        	}
++    	}
++    	else {
++        	pr_err("AMD_ESPI: Port address 0x%x is invalid\n", message_io->port);
++        	return CB_ERR;
++    	}
++
++	switch (message_io->len) {
++		case 1:
++			outb(message_io->data.data_b, message_io->port);
++			break;
++		case 2:
++			outw(message_io->data.data_w, message_io->port);
++			break;
++		case 4:
++			outl(message_io->data.data_l, message_io->port);
++			break;
++		default:
++			pr_err("AMD_ESPI: %s, Length of IO packet is not valid\n", __func__);
++			return CB_ERR;
++	}
++
++	return CB_SUCCESS;
++}
++
++static int espi_periph_io_read(struct amd_espi* amd_espi, struct periph_io_rw *message_io)
++{
++	struct io_mmio_decode_config io_config;
++	espi_get_io_mmio_decode_info(amd_espi, &io_config);
++
++        /*Check if port address is valid and if the range is enabled*/
++        if (message_io->port == io_config.range0.base_addr_range0) {
++                if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE0))
++                {
++                        pr_err("AMD_ESPI: IO range0 not enabled for port address: 0x%x\n", message_io->port);
++                        return CB_ERR;
++                }
++        }
++        else if(message_io->port == io_config.range0.base_addr_range1) {
++                if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE1))
++                {
++                        pr_err("AMD_ESPI: IO range1 not enabled for port address: 0x%x\n", message_io->port);
++                        return CB_ERR;
++                }
++        }
++        else if(message_io->port == io_config.range1.base_addr_range2) {
++                if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE2))
++                {
++                        pr_err("AMD_ESPI: IO range2 not enabled for port address: 0x%x\n", message_io->port);
++                        return CB_ERR;
++                }
++        }
++        else if(message_io->port == io_config.range1.base_addr_range3) {
++                if (!(io_config.io_mmio_dc_enable & IO_DECODE_RANGE3))
++                {
++                        pr_err("AMD_ESPI: IO range1 not enabled for port address: 0x%x\n", message_io->port);
++                        return CB_ERR;
++                }
++        }
++        else {
++                pr_err("AMD_ESPI: Port address 0x%x is invalid\n", message_io->port);
++                return CB_ERR;
++        }
++
++	switch (message_io->len) {
++		case 1:
++			message_io->data.data_b = inb(message_io->port);
++			break;
++		case 2:
++			message_io->data.data_w = inw(message_io->port);
++			break;
++		case 4:
++			message_io->data.data_l = inl(message_io->port);
++			break;
++		default:
++			pr_info("AMD_ESPI: %s, Length of IO packet is not valid\n", __func__);
++			return CB_ERR;
++	}
++
++	return CB_SUCCESS;
++}
++
++static int amd_espi_get_master_cap(struct amd_espi* amd_espi, struct espi_master *master)
++{
++	u32 master_cap_reg = 0;
++	unsigned int info;
++
++	master_cap_reg = amd_espi_readreg32(amd_espi, AMD_MASTER_CAP_REG);
++	//Supported channels by master
++	if (master_cap_reg & BIT(0)) {
++		master->caps.flash_ch_en = 1;
++	}
++	if (master_cap_reg & BIT(1)) {
++		master->caps.oob_ch_en = 1;
++	}
++	if (master_cap_reg & BIT(2)) {
++		master->caps.vw_ch_en = 1;
++	}
++	if (master_cap_reg & BIT(3)) {
++		master->caps.periph_ch_en = 1;
++	}
++
++	//espi_version
++	master->caps.espi_version = (master_cap_reg << 25) >> 29;
++
++	//operating frequency supported by master
++	info = (master_cap_reg << 4) >> 29;
++	switch(info) {
++		case CNTRL_OP_FREQ_66:
++			master->caps.op_freq_66 = 1;
++			fallthrough;
++		case CNTRL_OP_FREQ_33:
++			master->caps.op_freq_33 = 1;
++			fallthrough;
++		case CNTRL_OP_FREQ_16:
++			master->caps.op_freq_16 = 1;
++			break;
++		default:
++			pr_err("AMD_ESPI: %s, operating frequency Error\n", __func__);
++			return -ENOTSUPP;
++	}
++
++	//IO_MODE
++	info = (master_cap_reg << 2) >> 30;
++	switch(info) {
++		case IO_MODE_QUAD:
++			master->caps.io_mode_quad = 1;
++			fallthrough;
++		case IO_MODE_DUAL:
++			master->caps.io_mode_dual = 1;
++			fallthrough;
++		case IO_MODE_SINGLE:
++			master->caps.io_mode_single = 1;
++			break;
++		default:
++			pr_err("AMD_ESPI: %s, IO Mode Error\n", __func__);
++			return -ENOTSUPP;
++	}
++
++	//NO of slaves:
++	master->caps.no_of_slaves = (master_cap_reg << 7) >> 29;
++
++	//PC channel Max payload size
++	master->caps.pc_ch_max_payload_size = (master_cap_reg << 10) >> 29;
++
++	//flash access channel max payload size
++	master->caps.flash_ch_max_payload = (master_cap_reg << 22) >> 29;
++
++	//OOB Message Channel Maximum Payload Size
++	master->caps.oob_ch_max_payload = (master_cap_reg << 19) >> 29;
++
++	//Maximum Virtual Wire Count
++	master->caps.vw_ch_max_count = (master_cap_reg << 13) >> 26;
++
++	//alert mode support by master
++	master->caps.alert_mode = (master_cap_reg << 1) >> 31;
++
++	//CRC support by master
++	master->caps.crc_check_support = !((master_cap_reg >> 31) & 1);
++
++	return CB_SUCCESS;
++}
++
++static int set_def_initial_config(struct espi_master *master, struct espi_device *dev)
++{
++	switch(espi_channel) {
++		case 0: 
++			if ( master->caps.periph_ch_en ) {
++				dev->channel_modes = CHANNEL_MODE_PC;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case 1: 
++			if (master->caps.vw_ch_en) {
++				dev->channel_modes = CHANNEL_MODE_VW;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case 2:
++			if (master->caps.oob_ch_en) {
++				dev->channel_modes = CHANNEL_MODE_OOB;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case 3:
++			if (master->caps.flash_ch_en) {
++				dev->channel_modes = CHANNEL_MODE_FLASH;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		default:
++			dev->channel_modes = CHANNEL_MODE_PC;
++	}
++
++	switch(espi_io_mode) {
++		case IO_MODE_SINGLE:
++			if (master->caps.io_mode_single){
++				dev->io_mode = IO_MODE_SINGLE;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case IO_MODE_DUAL:
++			if (master->caps.io_mode_dual){
++				dev->io_mode = IO_MODE_DUAL;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case IO_MODE_QUAD:
++			if (master->caps.io_mode_quad){
++				dev->io_mode = IO_MODE_QUAD;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		default:
++			dev->io_mode = IO_MODE_SINGLE;
++	}
++
++	switch(espi_op_freq) {
++		case 16:
++			if (master->caps.op_freq_16){
++				dev->op_freq = SLAVE_OP_FREQ_16;
++			} else { 
++				return -ENOTSUPP;
++			}
++			break;
++		case 33:
++			if (master->caps.op_freq_33){
++				dev->op_freq = SLAVE_OP_FREQ_33;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		case 66:
++			if (master->caps.op_freq_66) {
++				dev->op_freq = SLAVE_OP_FREQ_66;
++			} else {
++				return -ENOTSUPP;
++			}
++			break;
++		default:
++			dev->op_freq = SLAVE_OP_FREQ_16;
++	}
++	return CB_SUCCESS;
++}
++
++static int amd_espi_control_reg_init(struct amd_espi *amd_espi)
++{
++	u32 espi_version, global_ctrl_reg;
++	
++	//TODO: (1) WRT VW
++	/*(2) Check master_cap_reg version*/
++	espi_version = amd_espi_readreg32(amd_espi, AMD_MASTER_CAP_REG); 
++	espi_version = espi_version & (7 << 3);
++
++	/*(3,4)watchdog enable and wait state control enable*/
++	global_ctrl_reg = amd_espi_readreg32(amd_espi, AMD_ESPI_GLOBAL_CNTRL_REG0);
++
++	if (!((global_ctrl_reg & 0x1) && (global_ctrl_reg & 0x2)))
++		global_ctrl_reg = global_ctrl_reg | 0x3;
++
++	//set watchdog value
++	/* (5)Set Wait State counter to 0x3F */
++	global_ctrl_reg = global_ctrl_reg | (0x3F << 23);
++
++	amd_espi_writereg32(amd_espi, AMD_ESPI_GLOBAL_CNTRL_REG0, global_ctrl_reg);
++
++	/* (7,10)Set Slave0 Error Interrupt enable[19:0] and Command interrupt enable [31:24] */
++	amd_espi_writereg32(amd_espi, ESPI_SLAVE0_INT_EN, 0);
++
++
++	/* (17)espi Bus Master Enable */ 
++	if( !(global_ctrl_reg & ESPI_BUS_MASTER_EN)){        
++		global_ctrl_reg = global_ctrl_reg | ESPI_BUS_MASTER_EN;
++		amd_espi_writereg32(amd_espi, AMD_ESPI_GLOBAL_CNTRL_REG1, global_ctrl_reg);
++	}
++
++	return CB_SUCCESS;
++}
++
++static void espi_set_initial_config(struct amd_espi *amd_espi)
++{
++	uint32_t espi_initial_mode = 0;
++	espi_initial_mode = amd_espi_readreg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG);
++	espi_initial_mode |= ((CNTRL_SLAVE0_OP_FREQ_16 << 25) | (IO_MODE_SINGLE << 28));
++	amd_espi_writereg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG, espi_initial_mode);
++}
++
++static int amd_espi_init_slave(struct amd_espi *amd_espi, struct espi_device *espi_dev)
++{
++	struct espi_master *master = amd_espi->master;
++	int ret;
++	u32 slave_caps = 0;
++
++/*	espi_set_initial_config(amd_espi);
++	if (amd_espi_inband_reset(amd_espi) != CB_SUCCESS) {
++		pr_err("AMD_ESPI: In-band reset failed!\n");
++		return CB_ERR;
++	}*/
++	espi_set_initial_config(amd_espi);
++	ret = amd_espi_get_master_cap(amd_espi, master);
++
++	if (ret != CB_SUCCESS) {
++		pr_err("AMD_ESPI: %s, master capability returns error\n", __func__);
++		return -ENOTSUPP;
++	}
++
++	ret = set_def_initial_config(master, espi_dev);
++	if (ret != CB_SUCCESS) {
++		pr_err("AMD_ESPI: %s, def_initial_config returns error\n", __func__);
++		return -ENOTSUPP;
++	}
++
++	if (amd_espi_Set_General_Config(amd_espi, espi_dev) != CB_SUCCESS)
++		return CB_ERR;
++
++	if (amd_espi_Get_General_Config(amd_espi, &slave_caps) != CB_SUCCESS)
++		return CB_ERR;
++
++	if (amd_espi_setup_periph_channel(amd_espi, slave_caps) != CB_SUCCESS){
++		pr_err("AMD_ESPI: %s: amd_espi_setup_periph_channel failed\n", __func__);
++		return CB_ERR;
++	}
++
++	return CB_SUCCESS;
++}
++
++static void espi_disable_io_decode_range(struct amd_espi *amd_espi, unsigned int io_range)
++{
++	u32 io_mmio_dc_enable = amd_espi_readreg32(amd_espi, ESPI_IO_MMIO_DECODE_EN_REG);
++
++	switch(io_range)
++	{
++		case 1:
++			if (io_mmio_dc_enable & IO_DECODE_RANGE0)
++				io_mmio_dc_enable = io_mmio_dc_enable ^ IO_DECODE_RANGE0;
++			break;
++		case 2:
++			if (io_mmio_dc_enable & IO_DECODE_RANGE1)
++				io_mmio_dc_enable = io_mmio_dc_enable ^ IO_DECODE_RANGE1;
++			break;
++		case 3:
++			if (io_mmio_dc_enable & IO_DECODE_RANGE2)
++				io_mmio_dc_enable = io_mmio_dc_enable ^ IO_DECODE_RANGE2;
++			break;
++		case 4:
++			if (io_mmio_dc_enable & IO_DECODE_RANGE3)
++				io_mmio_dc_enable = io_mmio_dc_enable ^ IO_DECODE_RANGE3;
++			break;
++		default:
++			break;
++	}
++
++	amd_espi_writereg32(amd_espi, ESPI_IO_MMIO_DECODE_EN_REG, io_mmio_dc_enable);	
++}
++
++static void espi_set_io_mmio_decode_config(struct amd_espi *amd_espi, struct io_mmio_decode_config *config)
++{
++		struct io_mmio_decode_config io_dc_config;
++		espi_get_io_mmio_decode_info(amd_espi, &io_dc_config);
++		
++		amd_espi_writereg32(amd_espi, ESPI_IO_MMIO_DECODE_EN_REG,
++				    ((~(config->io_mmio_dc_enable) & io_dc_config.io_mmio_dc_enable) | config->io_mmio_dc_enable));
++		
++		if(config->io_mmio_dc_enable & IO_DECODE_RANGE0){
++			if(config->range0.base_addr_range0 != io_dc_config.range0.base_addr_range0){
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG0, ((io_dc_config.range0.val & ~(0xffff)) | config->range0.val));
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG2, ((io_dc_config.range2.val & ~(0xff)) | config->range2.val));
++ 			}
++		}
++		
++		if(config->io_mmio_dc_enable & IO_DECODE_RANGE1){
++			if(config->range0.base_addr_range1 != io_dc_config.range0.base_addr_range1){
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG0, ((io_dc_config.range0.val & ~(0xffff << 16)) | config->range0.val));
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG2, ((io_dc_config.range2.val & ~(0xff << 8 )) | config->range2.val));
++ 			}
++		}
++		
++		if(config->io_mmio_dc_enable & IO_DECODE_RANGE2){
++			if(config->range1.base_addr_range2 != io_dc_config.range1.base_addr_range2){
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG1, ((io_dc_config.range1.val & ~(0xffff)) | config->range1.val));
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG2, ((io_dc_config.range2.val & ~(0xff << 16)) | config->range2.val));
++ 			}
++		}
++		
++		if(config->io_mmio_dc_enable & IO_DECODE_RANGE3){
++			if(config->range1.base_addr_range3 != io_dc_config.range1.base_addr_range3){
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG1, ((io_dc_config.range1.val & ~(0xffff << 16)) | config->range1.val));
++				amd_espi_writereg32(amd_espi, ESPI_TARGET_RANGE_REG2, ((io_dc_config.range2.val & ~(0xff << 24)) | config->range2.val));
++ 			}
++		}
++}
++
++static long amd_espi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct amd_espi *amd_espi;
++	struct espi_device *dev;
++	struct config *config = NULL;
++	struct periph_io_rw *message_io = NULL;
++	struct espi_master *master = NULL;
++	struct io_mmio_decode_config *io_dc_config = NULL;
++	u32 ret;
++	u32 slave_config;
++	u32 ctrlr_config;
++	u32 io_range = 0;
++	int op_freq = 0;
++	int io_mode = 0; 
++	
++	amd_espi = filp->private_data;
++	master = amd_espi->master;
++
++	dev = kzalloc(sizeof(struct espi_device), GFP_KERNEL);
++	if (!dev)
++		return -ENOMEM;
++
++	config = kzalloc(sizeof(struct config), GFP_KERNEL);
++	if (!config)
++		return -ENOMEM;
++
++	message_io = kzalloc(sizeof(struct periph_io_rw), GFP_KERNEL);
++        if (!message_io)
++                return -ENOMEM;
++
++	io_dc_config = kzalloc(sizeof(struct io_mmio_decode_config), GFP_KERNEL);
++        if (!io_dc_config)
++                return -ENOMEM;
++
++	/* Check type and command number */
++	if (_IOC_TYPE(cmd) != ESPI_MAGIC_NUMBER)
++		return -EINVAL;
++
++	switch(cmd)
++	{
++		case ESPI_SET_CONFIG :
++			if (copy_from_user(config, (struct config*)arg, sizeof(struct config))) {
++				return -EFAULT;
++			}
++
++			if (config->io_mode == IO_MODE_SINGLE)
++				dev->io_mode = IO_MODE_SINGLE;
++			else if (config->io_mode == IO_MODE_DUAL)
++				dev->io_mode = IO_MODE_DUAL;
++			else if (config->io_mode == IO_MODE_QUAD)
++				dev->io_mode = IO_MODE_QUAD;
++
++			if (config->op_freq == SLAVE_OP_FREQ_16)
++				dev->op_freq = SLAVE_OP_FREQ_16;
++			else if(config->op_freq == SLAVE_OP_FREQ_33)
++				dev->op_freq = SLAVE_OP_FREQ_33;
++			else if(config->op_freq == SLAVE_OP_FREQ_66)
++				dev->op_freq = SLAVE_OP_FREQ_66;
++
++			if (amd_espi_Set_General_Config(amd_espi, dev) != CB_SUCCESS)
++				return CB_ERR;
++
++			/* Channel Config */
++			if ((amd_espi_Get_General_Config(amd_espi, &slave_config)) != CB_SUCCESS)
++				return CB_ERR;
++
++			if (config->channel_mode == CHANNEL_MODE_PC){
++				if ((amd_espi_setup_periph_channel(amd_espi, slave_config)) != CB_SUCCESS) {
++					pr_err("AMD_ESPI: amd_espi_setup_periph_channel failed\n");
++					return CB_ERR;
++				}
++			}
++			else {
++				pr_err("AMD_ESPI: Opted channel not suported\n");
++				return CB_ERR;
++			}
++
++			break;
++
++		case ESPI_GET_CONFIG:
++
++			if(amd_espi_Get_General_Config(amd_espi, &ret) == CB_ERR)
++				return CB_ERR;
++
++			io_mode = (ret & (0x3 << ESPI_SLAVE_IO_MODE_SEL_SHIFT)) >> 26;
++			switch (io_mode) {
++				case IO_MODE_SINGLE:
++					config->io_mode = IO_MODE_SINGLE;
++					break;
++				case IO_MODE_DUAL:
++					config->io_mode = IO_MODE_DUAL;
++					break;
++				case IO_MODE_QUAD:
++					config->io_mode = IO_MODE_QUAD;
++					break;
++				default:
++					pr_err("AMD_ESPI: io_mode default case, returning error\n");
++					return CB_ERR;
++			}
++
++			op_freq = (ret & (0x7 << ESPI_SLAVE_OP_FREQ_SEL_SHIFT)) >> 20;
++			switch (op_freq) {
++				case SLAVE_OP_FREQ_16:
++					config->op_freq = SLAVE_OP_FREQ_16;
++					break;
++				case SLAVE_OP_FREQ_33:
++					config->op_freq = SLAVE_OP_FREQ_33;
++					break;
++				case SLAVE_OP_FREQ_66:
++					config->op_freq = SLAVE_OP_FREQ_66;
++					break;
++				default: 
++					pr_err("AMD_ESPI: op_freq default case, returning error\n");
++					return CB_ERR;
++			}
++
++
++			/* Channel enable info*/           
++			ret = amd_espi_chenbl_info(amd_espi);
++			config->channel_mode = 0;
++
++			if (ret == CB_ERR)
++                                config->channel_mode = CHAN_NOT_ENABLED;
++                        else {
++                                if(ret & CHANNEL_MODE_PC){
++                                        config->channel_mode |= CHANNEL_MODE_PC;
++                                }
++                                if(ret & CHANNEL_MODE_VW){
++                                        config->channel_mode |= CHANNEL_MODE_VW;
++                                }
++                                if(ret & CHANNEL_MODE_OOB){
++                                        config->channel_mode |= CHANNEL_MODE_OOB;
++                                }
++                                if(ret & CHANNEL_MODE_FLASH){
++                                        config->channel_mode |= CHANNEL_MODE_FLASH;
++                                }
++                        }
++
++			if (copy_to_user((struct config*)arg, config, sizeof(struct config)))
++			{
++				return -EFAULT;
++			}
++			break;
++
++		case ESPI_INBAND_RESET:
++			if (amd_espi_inband_reset(amd_espi) != CB_SUCCESS) {
++				pr_err("AMD_ESPI: In-band reset failed!\n");
++				return CB_ERR;
++			}
++			break;
++		case ESPI_SET_IO_MODE:
++
++			if (copy_from_user(config, (struct config*)arg, sizeof(struct config))) {
++				return -EFAULT;
++			}
++			ctrlr_config = amd_espi_readreg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG);
++
++
++			if (amd_espi_Get_General_Config(amd_espi, &slave_config) != CB_SUCCESS) {
++				return CB_ERR;
++			}
++
++			ret = amd_espi_setIoMode(amd_espi, &slave_config, &ctrlr_config, config->io_mode);
++			if (ret != CB_SUCCESS)
++			{
++				pr_err("AMD_ESPI: Set IO mode failed\n");
++				return CB_ERR;
++			}
++
++			ret = amd_espi_SetConfig(amd_espi, slave_config, ESPI_SLAVE_GENERAL_CAPS_CFG);
++			if (ret != CB_SUCCESS) {
++				pr_err("AMD_ESPI: Set IO mode failed\n");
++				return CB_ERR;
++			}
++			amd_espi_writereg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG, ctrlr_config);
++			break;
++
++		case ESPI_SET_CHAN_MODE :
++			if (copy_from_user(config, (struct config*)arg, sizeof(struct config))) {
++				return -EFAULT;
++			}
++
++			switch(config->channel_mode){
++				case CHANNEL_MODE_PC :
++					if ((amd_espi_Get_General_Config(amd_espi, &slave_config)) != CB_SUCCESS){
++						pr_err("AMD_ESPI: amd_espi_Get_General_Config for channel failed\n");
++						return CB_ERR;
++					}
++
++					if ((amd_espi_setup_periph_channel(amd_espi, slave_config)) != CB_SUCCESS) {
++						pr_err("AMD_ESPI: amd_espi_setup_periph_channel failed\n");
++						return CB_ERR;
++					}
++
++					break;
++				case CHANNEL_MODE_VW:
++					pr_err("AMD_ESPI: VW not supported\n");
++					break;
++				case CHANNEL_MODE_OOB:
++					pr_err("AMD_ESPI: OOB not supported\n");
++					break;
++				case CHANNEL_MODE_FLASH:
++					pr_err("AMD_ESPI: FLASH not supported\n");
++					break;
++				default:
++					pr_err("AMD_ESPI:Channel: not supported\n");
++					return CB_ERR;
++			}
++
++			break;
++		case  ESPI_SET_FREQ :
++
++			if (copy_from_user(config, (struct config*)arg, sizeof(struct config))) {
++				return -EFAULT;
++			}
++			ctrlr_config = amd_espi_readreg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG);
++
++			if (amd_espi_Get_General_Config(amd_espi, &slave_config) != CB_SUCCESS) {
++				return CB_ERR;
++			}
++
++
++			ret = amd_espi_setOpFreqMode(amd_espi, &slave_config,&ctrlr_config, config->op_freq);
++			if (ret != CB_SUCCESS)
++			{
++				pr_err("AMD_ESPI: Set OP Freq failed\n");
++				return CB_ERR;
++			}
++
++			ret = amd_espi_SetConfig(amd_espi, slave_config,ESPI_SLAVE_GENERAL_CAPS_CFG);
++			if (ret != CB_SUCCESS) {
++				pr_err("AMD_ESPI: Set OP Freq failed\n");
++				return CB_ERR;
++			}
++			amd_espi_writereg32(amd_espi, CNTRL_SLAVE0_CONFIG_REG, ctrlr_config);
++
++			break;
++		case ESPI_IO_WRITE:
++			if (copy_from_user(message_io, (struct periph_io_rw *)arg, sizeof(struct periph_io_rw))) {
++				return -EFAULT;
++			}
++
++			ret = espi_periph_io_write(amd_espi, message_io);
++			if (ret != CB_SUCCESS) {
++				return CB_ERR;
++			}
++			break;
++
++		case ESPI_IO_READ:
++			if (copy_from_user(message_io, (struct periph_io_rw *)arg, sizeof(struct periph_io_rw))) {
++				return -EFAULT;
++			}
++			ret = espi_periph_io_read(amd_espi, message_io);
++			if (ret != CB_SUCCESS) {
++				return CB_ERR;
++			}
++			if (copy_to_user((struct periph_io_rw*)arg, message_io, sizeof(struct periph_io_rw))) {
++				return -EFAULT;
++			}
++			break;
++
++		case ESPI_GET_IODECODE_CONFIG:
++                        espi_get_io_mmio_decode_info(amd_espi, io_dc_config);
++
++                        if (copy_to_user((struct io_mmio_decode_config *)arg, io_dc_config, sizeof(struct io_mmio_decode_config)))
++                        {
++                            return -EFAULT;
++                        }
++                        break;
++			
++		case ESPI_EN_IODECODE_CONFIG:
++                        if (copy_from_user(io_dc_config, (struct io_mmio_decode_config *)arg, sizeof(struct io_mmio_decode_config))) {
++                            return -EFAULT;
++                        }
++        
++                        espi_set_io_mmio_decode_config(amd_espi, io_dc_config);
++			break;
++
++		case ESPI_DS_IODECODE_CONFIG:
++			if (copy_from_user(&io_range, (unsigned int *)arg, sizeof(unsigned int))) {
++				return -EFAULT;
++			}
++
++			espi_disable_io_decode_range(amd_espi, io_range);
++			break;
++
++		default:
++			pr_info("AMD_ESPI: ESPI command not found, returning error\n");
++			return -EINVAL;
++	}
++	kfree(dev);
++	kfree(config);
++	kfree(message_io);
++	kfree(io_dc_config);
++	return CB_SUCCESS;
++}
++
++static int amd_espi_open(struct inode *inode, struct file *filp)
++{
++	struct amd_espi *espi;
++	int    status = -ENXIO;
++
++	mutex_lock(&device_list_lock);
++
++	list_for_each_entry(espi, &device_list, device_entry) {
++		if (espi->dev_minor == inode->i_rdev) {
++			status = 0;
++			break;
++		}
++	}
++	if (status)
++	{ 
++		pr_debug("espi: nothing for minor %d\n", iminor(inode));
++	}
++
++	espi->users++;
++	filp->private_data = espi;
++	nonseekable_open(inode, filp);
++
++	mutex_unlock(&device_list_lock);
++
++	return status;
++}
++
++static int amd_espi_release(struct inode *inode, struct file *filp)
++{
++	struct amd_espi *espi;
++	int    status = 0;
++	int dofree;
++
++	mutex_lock(&device_list_lock);
++	espi = filp->private_data;
++	filp->private_data = NULL;
++
++	/* ... after we unbound from the underlying device? */
++	spin_lock_irq(&espi->espi_lock);
++	dofree = (espi->dev == NULL);
++	spin_unlock_irq(&espi->espi_lock);
++
++	/* last close? */
++	espi->users--;
++	if (!espi->users) {
++		if (dofree)
++			kfree(espi);
++	}
++	mutex_unlock(&device_list_lock);
++
++	return status;
++}
++
++static struct file_operations amd_espi_fops = {
++	.owner = THIS_MODULE,
++	.unlocked_ioctl = amd_espi_ioctl,
++	.open = amd_espi_open,
++	.release = amd_espi_release,
++};
++
++static int amd_espi_probe(struct platform_device *pdev)
++{
++	struct resource* res;
++	struct amd_espi* amd_espi;
++	struct device* dev = &pdev->dev;
++	struct espi_device *espi_dev;
++	int err;
++	int ret = -1;
++
++	amd_espi = devm_kzalloc(dev, sizeof(struct amd_espi), GFP_KERNEL);
++	if (!amd_espi)
++		return -ENOMEM;
++
++	amd_espi->master = devm_kzalloc(dev, sizeof(struct espi_master), GFP_KERNEL);
++	if (!amd_espi->master)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&amd_espi->device_entry);
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENOMEM;
++
++	amd_espi->io_remap_addr = devm_ioremap_resource(dev, res);
++
++	if (IS_ERR(amd_espi->io_remap_addr)) {
++		err = PTR_ERR(amd_espi->io_remap_addr);
++		dev_err(dev, "error %d ioremap of eSPI registers failed\n", err);
++		return err;
++	}
++
++	ret = alloc_chrdev_region(&amd_espi->dev_minor, 0, ESPI_DEV_MINORS, "amd_espi");
++	if (ret < 0)
++	{
++		pr_err("AMD_ESPI: Device numbers allocation failed: %d\n", ret);
++		return ret;
++	}
++	cdev_init(&cdev, &amd_espi_fops);
++	cdev_add(&cdev, amd_espi->dev_minor, N_ESPI_MINORS);
++
++	amd_espi_dev_class = class_create("amd_espi");
++	if (IS_ERR(amd_espi_dev_class))
++	{
++		pr_err("AMD_ESPI: class_create faied\n");
++		cdev_del(&cdev);
++		return PTR_ERR(amd_espi_dev_class);
++	}
++
++	amd_espi->dev = dev;
++	dev = device_create(amd_espi_dev_class, NULL, amd_espi->dev_minor, &amd_espi, "amd_espi");
++	if (IS_ERR(dev))
++	{
++		pr_err("AMD_ESPI: device_create faied\n");
++		class_destroy(amd_espi_dev_class);
++		cdev_del(&cdev);
++		return PTR_ERR(dev);
++	}
++	else {
++		list_add(&amd_espi->device_entry, &device_list);
++	}
++
++	platform_set_drvdata(pdev, amd_espi);
++
++	//allocate mem for espi_device
++	espi_dev = devm_kzalloc(dev, sizeof(struct espi_device), GFP_KERNEL);
++	if (!espi_dev)
++		return -ENOMEM;
++
++	err = amd_espi_control_reg_init(amd_espi);
++	if (err != CB_SUCCESS)
++		return -ENOTSUPP;
++
++	err = amd_espi_init_slave(amd_espi, espi_dev);
++	if (err != CB_SUCCESS)
++		return -ENOTSUPP;
++
++	pr_info("AMD ESPI device initialization completed\n");
++
++	return 0;
++}
++
++static int amd_espi_remove(struct platform_device *pdev)
++{
++	struct amd_espi* amd_espi = platform_get_drvdata(pdev);
++
++	list_del(&amd_espi->device_entry);
++	device_destroy(amd_espi_dev_class, amd_espi->dev_minor);
++	class_destroy(amd_espi_dev_class);
++	cdev_del(&cdev);
++	unregister_chrdev_region(amd_espi->dev_minor, ESPI_DEV_MINORS);
++	kfree(amd_espi->master);
++	kfree(amd_espi);
++	pr_info("AMD ESPI device removed\n");
++
++	return 0;
++}
++
++#ifdef CONFIG_ACPI
++static const struct acpi_device_id espi_acpi_match[] = {
++	{ "AMDI0070", AMD_ESPI_V1 },
++	{},
++};
++MODULE_DEVICE_TABLE(acpi, espi_acpi_match);
++#endif
++
++static struct platform_driver amd_espi_driver = {
++	.driver = {
++		.name = "amd_espi",
++		.owner = THIS_MODULE,
++		.acpi_match_table = ACPI_PTR(espi_acpi_match),
++	},
++	.probe = amd_espi_probe,
++	.remove = amd_espi_remove,
++};
++
++module_platform_driver(amd_espi_driver);
++
++module_param(espi_channel, int, S_IRUGO|S_IWUSR); //Last argument to be confirmed
++MODULE_PARM_DESC(espi_channel, "An integer. PC: 0, VW: 1, OOB: 2, Flash: 3");
++module_param(espi_io_mode, int, S_IRUGO|S_IWUSR); //Last argument to be confirmed
++MODULE_PARM_DESC(espi_io_mode, "An integer. Single: 0, Dual: 1, Quad: 2");
++module_param(espi_op_freq, int, S_IRUGO|S_IWUSR); //Last argument to be confirmed
++MODULE_PARM_DESC(espi_op_freq, "An integer, 16/33/66");
++
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_AUTHOR("AMD Linux Platform driver team");
++MODULE_DESCRIPTION("ESPI Controller device driver");
+diff --git a/drivers/spi/espi.h b/drivers/spi/espi.h
+new file mode 100644
+index 000000000..c2df48647
+--- /dev/null
++++ b/drivers/spi/espi.h
+@@ -0,0 +1,276 @@
++#include <linux/ioctl.h>
++#include <linux/uaccess.h>
++
++#define CB_SUCCESS 0
++#define CB_ERR     -1
++
++/*Master dependent register*/
++#define AMD_ESPI_DS_HEADER_REG0      0x00
++#define AMD_ESPI_DS_HEADER_REG1      0x04
++#define AMD_ESPI_DS_HEADER_REG2      0x08
++#define AMD_ESPI_DS_DATA_REG0        0x0C
++
++/*Slave dependent register*/
++#define ESPI_IO_MMIO_DECODE_EN_REG    0x40       //40+70*N+00
++#define ESPI_TARGET_RANGE_REG0     0x44	//40+70*N+04	
++#define ESPI_TARGET_RANGE_REG1     0x48	//40+70*N+08	
++#define ESPI_TARGET_RANGE_REG2     0x4C	//40+70*N+0C	
++
++#define ESPI_MMIO_REG0                0x50       //40+70*N+10
++#define ESPI_MMIO_REG1                0x54       //40+70*N+14
++#define ESPI_MMIO_REG2                0x58       //40+70*N+18
++#define ESPI_MMIO_REG3                0x5C       //40+70*N+1C
++#define ESPI_MMIO_REG4                0x60       //40+70*N+20
++#define ESPI_MMIO_REG5                0x64       //40+70*N+24
++
++#define CNTRL_SLAVE0_CONFIG_REG      0x68       //0x40+70*N+28
++#define AMD_INT_ENABLE               0x6C       //40+70*N+2C
++#define AMD_INT_STATUS               0x70       //40+70*N+30
++
++/*Slave Status*/
++#define ESPI_SLAVE0_INT_EN           0x6c
++#define ESPI_SLAVE0_INT_STS          0x70
++#define ESPI_STATUS_DNCMD_COMPLETE   (1 << 28)
++#define ESPI_STATUS_NON_FATAL_ERROR  (1 << 6)
++#define ESPI_STATUS_FATAL_ERROR      (1 << 5)
++#define ESPI_STATUS_NO_RESPONSE	     (1 << 4)
++#define ESPI_STATUS_CRC_ERR          (1 << 2)
++#define ESPI_STATUS_WAIT_TIMEOUT     (1 << 1)
++#define ESPI_STATUS_BUS_ERROR	     (1 << 0)
++#define ESPI_PC_MSG_RCVD		 (1 << 29)
++
++/*Master capability and control Reg*/
++#define AMD_MASTER_CAP_REG           0x2C
++#define AMD_ESPI_GLOBAL_CNTRL_REG0   0x30
++#define AMD_ESPI_GLOBAL_CNTRL_REG1   0x34
++#define ESPI_BUS_MASTER_EN			(1 << 1)
++#define ESPI_ERR_INT_MAP_SHIFT		 8
++#define ESPI_ERR_INT(irq)			 ((irq) << ESPI_ERR_INT_MAP_SHIFT)
++#define ESPI_ERR_INT_SMI			 (0x1f << ESPI_ERR_INT_MAP_SHIFT)   
++#define ESPI_RGCMD_INT_MAP_SHIFT	 13
++#define ESPI_RGCMD_INT(irq)			 ((irq) << ESPI_RGCMD_INT_MAP_SHIFT)
++#define ESPI_RGCMD_INT_SMI			 (0x1f << ESPI_RGCMD_INT_MAP_SHIFT) 
++
++/*Master/Slave capability config*/
++#define CHANNEL_MODE_PC              BIT(3)
++#define CHANNEL_MODE_VW              BIT(2)
++#define CHANNEL_MODE_OOB             BIT(1)
++#define CHANNEL_MODE_FLASH           BIT(0)
++#define CHAN_NOT_ENABLED             BIT(4)
++
++/*
++ * IO MODE encoding values:
++ * 00 - Single I/O
++ * 01 - Dual I/O, Single I/O
++ * 10 - Quad I/O, Dual I/O, single I/O
++ */
++#define IO_MODE_SINGLE               0x0
++#define IO_MODE_DUAL                 0x1
++#define IO_MODE_QUAD                 0x2
++
++/* 
++ * Operating Support Frequency values
++ * 000 - 16.7 MHz
++ * 001 - 16.7 MHz, 33 MHz
++ * 011 - 16.7 MHz, 33 MHz, 66 MHz
++*/
++#define CNTRL_OP_FREQ_16                   0x0
++#define CNTRL_OP_FREQ_33                   0x1
++#define CNTRL_OP_FREQ_66                   0x3
++
++#define SLAVE_OP_FREQ_16             0x0
++#define SLAVE_OP_FREQ_33             0x2
++#define SLAVE_OP_FREQ_66             0x4
++
++#define CNTRL_SLAVE0_OP_FREQ_16	     0x0
++#define CNTRL_SLAVE0_OP_FREQ_33	     0x1
++#define CNTRL_SLAVE0_OP_FREQ_66	     0x2
++
++/*IOCTL calls*/
++#define ESPI_MAGIC_NUMBER            'i'
++#define ESPI_SET_CONFIG              _IOW(ESPI_MAGIC_NUMBER, 0x1, struct config)
++#define ESPI_GET_CONFIG              _IOR(ESPI_MAGIC_NUMBER, 0x2, struct config)
++#define ESPI_INBAND_RESET            _IO(ESPI_MAGIC_NUMBER, 0x3)
++#define ESPI_SET_IO_MODE             _IOW(ESPI_MAGIC_NUMBER, 0x4, struct config)
++#define ESPI_SET_CHAN_MODE           _IOW(ESPI_MAGIC_NUMBER, 0x5, struct config)
++#define ESPI_SET_FREQ                _IOW(ESPI_MAGIC_NUMBER, 0x6, struct config)
++#define ESPI_IO_WRITE                _IOWR(ESPI_MAGIC_NUMBER, 0x7, struct periph_io_rw)
++#define ESPI_IO_READ                 _IOWR(ESPI_MAGIC_NUMBER, 0x8, struct periph_io_rw)
++#define ESPI_GET_IODECODE_CONFIG     _IOWR(ESPI_MAGIC_NUMBER, 0x9, struct io_mmio_decode_config)
++#define ESPI_EN_IODECODE_CONFIG      _IOWR(ESPI_MAGIC_NUMBER, 0xa, struct io_mmio_decode_config)
++#define ESPI_DS_IODECODE_CONFIG      _IOWR(ESPI_MAGIC_NUMBER, 0xb, unsigned int)
++
++#define IO_DECODE_RANGE0  0x0100
++#define IO_DECODE_RANGE1  0x0200
++#define IO_DECODE_RANGE2  0x0400
++#define IO_DECODE_RANGE3  0x0800
++
++struct master_caps {
++	// Channel support by master, bits [0:3]
++	u32 periph_ch_en:1;
++	u32 vw_ch_en:1;
++	u32 oob_ch_en:1;
++	u32 flash_ch_en:1;
++
++	//eSPI version, bits [4:6]
++	u32 espi_version:3;
++
++	//flash access channel max supported payload, bits[7:9]
++	u32 flash_ch_max_payload:3;
++
++	//OOB Message channel max supported payload, bits[12:10]
++	u32 oob_ch_max_payload:3;
++
++	//Operating Maximum Virtual Wire Count, bits[13:18]
++	u32 vw_ch_max_count:6;
++
++	//Peripheral Channel max supported payload, bits[21:19]
++	u32 pc_ch_max_payload_size:3;
++
++	//Number of slaves supported by master bits, [22:24]
++	u32 no_of_slaves:3;
++
++	//Operating frequencies, bits [25:27]
++	u32 op_freq_66:1;
++	u32 op_freq_33:1;
++	u32 op_freq_16:1;
++
++	//IO modes bits [29:28]
++	u32 io_mode_single:1;
++	u32 io_mode_dual:1;
++	u32 io_mode_quad:1;
++
++	//Alert mode bit [30], 0 - I/O[1], 1 - Dedicated alert pin
++	u32 alert_mode:1;	
++
++	//CRC Checking Support by Master, 0 - support, 1 - Doesn't Support  
++	u32 crc_check_support:1;
++}__packed;
++
++struct espi_master {
++	struct device *dev;
++	s16 bus_num;
++	u16 chip_select;
++	u32 mode_bits;
++	u16 flags;
++	struct master_caps caps;
++}__packed;
++
++struct espi_device {
++    u8 io_mode;
++    u8 channel_modes;
++    u8 op_freq;
++};
++
++struct config {
++    u8 io_mode;
++    u8 channel_mode;
++    u8 op_freq;
++};
++
++union io_data {
++	u8 data_b;
++	u16 data_w;
++	u32 data_l;
++} __packed;
++
++struct periph_io_rw {
++	u8 len;
++	u16 port;
++	union io_data data;
++} __packed;
++
++enum espi_cmd_type {
++    SET_CONFIGURATION = 0,
++    GET_CONFIGURATION = 1,
++    IN_BAND_RESET = 2,
++    PERIPHERAL_CHNL = 4,
++    VW_CHNL = 5,
++    OOB_CHNL = 6,
++    FLASH_CHNL = 7,
++};
++
++/* TX Header and data packet */
++union espi_txhdr0 {
++    u32 val;
++    struct {
++        u32 cmd_type:3;
++        u32 cmd_status:1;
++        u32 slave_sel:2;
++        u32 rsvd:2;
++        u32 hdata0:8;
++        u32 hdata1:8;
++        u32 hdata2:8;
++    };
++} __packed;
++
++union espi_txhdr1 {
++    u32 val;
++    struct {
++        u32 hdata3:8;
++        u32 hdata4:8;
++        u32 hdata5:8;
++        u32 hdata6:8;
++    };
++} __packed;
++
++union espi_txhdr2 {
++    u32 val;
++    struct {
++        u32 hdata7:8;
++        u32 rsvd:24;
++    };
++} __packed;
++
++union espi_txdata {
++    u32 val;
++    struct {
++        u32 dbyte0:8;
++        u32 dbyte1:8;
++        u32 dbyte2:8;
++        u32 dbyte3:8;
++    };
++} __packed;
++
++struct espi_txcmd {
++    union espi_txhdr0 hdr0;
++    union espi_txhdr1 hdr1;
++    union espi_txhdr2 hdr2;
++    union espi_txdata data;
++    u32 expected_status_codes;
++} __packed;
++
++//Data structures for IO decode configuartions
++union io_target_range0 {
++	u32 val;
++	struct {
++		u16 base_addr_range0;
++		u16 base_addr_range1;
++	};
++} __packed;
++
++union io_target_range1 {
++	u32 val;
++	struct {
++		u16 base_addr_range2;
++		u16 base_addr_range3;
++	};
++} __packed;
++
++union io_target_range2 {
++	u32 val;
++	struct {
++		u32 io_range0_size:8;
++		u32 io_range1_size:8;
++		u32 io_range2_size:8;
++		u32 io_range3_size:8;
++	};
++} __packed;
++
++struct io_mmio_decode_config {
++	u32 io_mmio_dc_enable;
++	union io_target_range0 range0;
++	union io_target_range1 range1;
++	union io_target_range2 range2;
++} __packed;
++
+diff --git a/drivers/spi/espi_slave.h b/drivers/spi/espi_slave.h
+new file mode 100644
+index 000000000..e8d737cd4
+--- /dev/null
++++ b/drivers/spi/espi_slave.h
+@@ -0,0 +1,103 @@
++#define ESPI_SLAVE_GENERAL_CAPS_CFG				0x08
++
++#define  ESPI_SLAVE_IO_MODE_SEL_SHIFT			26
++#define  ESPI_SLAVE_IO_MODE_SEL_MASK			~(0x3 << ESPI_SLAVE_IO_MODE_SEL_SHIFT)
++#define  ESPI_SLAVE_IO_MODE_SEL_VAL(x)			((x) << ESPI_SLAVE_IO_MODE_SEL_SHIFT)
++#define  ESPI_SLAVE_IO_MODE_SEL_SINGLE			ESPI_SLAVE_IO_MODE_SEL_VAL(0)
++#define  ESPI_SLAVE_IO_MODE_SEL_DUAL			ESPI_SLAVE_IO_MODE_SEL_VAL(1)
++#define  ESPI_SLAVE_IO_MODE_SEL_QUAD			ESPI_SLAVE_IO_MODE_SEL_VAL(2)
++
++#define  ESPI_SLAVE_IO_MODE_SUPP_SHIFT			24
++#define  ESPI_SLAVE_IO_MODE_SUPP_MASK			(0x3 << ESPI_SLAVE_IO_MODE_SUPP_SHIFT)
++#define  ESPI_SLAVE_IO_MODE_SUPP_VAL(x)			((x) << ESPI_SLAVE_IO_MODE_SUPP_SHIFT)
++#define  ESPI_SLAVE_IO_MODE_SUPP_SINGLE_ONLY		ESPI_SLAVE_IO_MODE_SUPP_VAL(0)
++#define  ESPI_SLAVE_IO_MODE_SUPP_SINGLE_DUAL		ESPI_SLAVE_IO_MODE_SUPP_VAL(1)
++#define  ESPI_SLAVE_IO_MODE_SUPP_SINGLE_QUAD		ESPI_SLAVE_IO_MODE_SUPP_VAL(2)
++#define  ESPI_SLAVE_IO_MODE_SUPP_SINGLE_DUAL_QUAD	ESPI_SLAVE_IO_MODE_SUPP_VAL(3)
++
++#define  ESPI_SLAVE_OP_FREQ_SEL_SHIFT			20
++#define  ESPI_SLAVE_OP_FREQ_SEL_MASK			~(0x7 << ESPI_SLAVE_OP_FREQ_SEL_SHIFT)
++#define  ESPI_SLAVE_OP_FREQ_SEL_VAL(x)			((x) << ESPI_SLAVE_OP_FREQ_SEL_SHIFT)
++#define  ESPI_SLAVE_OP_FREQ_SEL_16_MHZ          	ESPI_SLAVE_OP_FREQ_SEL_VAL(0)
++#define  ESPI_SLAVE_OP_FREQ_SEL_33_MHZ			ESPI_SLAVE_OP_FREQ_SEL_VAL(2)
++#define  ESPI_SLAVE_OP_FREQ_SEL_66_MHZ			ESPI_SLAVE_OP_FREQ_SEL_VAL(4)
++
++#define  ESPI_SLAVE_OP_FREQ_SUPP_SHIFT			16
++#define  ESPI_SLAVE_OP_FREQ_SUPP_MASK			(0x7 << ESPI_SLAVE_OP_FREQ_SUPP_SHIFT)
++#define  ESPI_SLAVE_OP_FREQ_SUPP_VAL(x)			((x) << ESPI_SLAVE_OP_FREQ_SUPP_SHIFT)
++#define  ESPI_SLAVE_OP_FREQ_SUPP_16_MHZ			ESPI_SLAVE_OP_FREQ_SUPP_VAL(0)
++#define  ESPI_SLAVE_OP_FREQ_SUPP_33_MHZ			ESPI_SLAVE_OP_FREQ_SUPP_VAL(2)
++#define  ESPI_SLAVE_OP_FREQ_SUPP_66_MHZ			ESPI_SLAVE_OP_FREQ_SUPP_VAL(4)
++
++//Channel ready/emable reg: all channel specific regs use te same bits
++#define  ESPI_SLAVE_CHANNEL_READY		(1 << 1)
++#define  ESPI_SLAVE_CHANNEL_ENABLE		(1 << 0)
++
++//Peripheral channel Capabilities and Configurations
++#define ESPI_SLAVE_PERIPH_CFG				0x10
++#define  ESPI_SLAVE_PERIPH_BUS_MASTER_ENABLE		(1 << 2)
++//End of Peripheral channel Capabilities and Configurations
++
++//VW channel Capabilities and Configurations
++#define ESPI_SLAVE_VW_CFG				0x20
++//End of VW channel Capabilities and Configurations
++
++//OOB channel Capabilities and Configurations
++#define ESPI_SLAVE_OOB_CFG				0x30
++//End of OOB channel Capabilities and Configurations
++
++//Flash channel Capabilities and Configurations
++#define ESPI_SLAVE_FLASH_CFG				0x40
++//End of Flash channel Capabilities and Configurations
++
++//Slave's channel supports
++#define  ESPI_SLAVE_FLASH_CH_SUPP			(1 << 3)
++#define  ESPI_SLAVE_OOB_CH_SUPP				(1 << 2)
++#define  ESPI_SLAVE_VW_CH_SUPP				(1 << 1)
++#define  ESPI_SLAVE_PERIPH_CH_SUPP			(1 << 0)
++
++#define PUT_IOWR_SHORT_1B 0x44
++#define PUT_IOWR_SHORT_2B 0x45
++#define PUT_IOWR_SHORT_4B 0x47
++
++#define PUT_IORD_SHORT_1B 0x40
++#define PUT_IORD_SHORT_2B 0x41
++#define PUT_IORD_SHORT_4B 0x43
++
++static inline bool espi_slave_supports_quad_io(u32 caps)
++{
++	u32 mode = caps & ESPI_SLAVE_IO_MODE_SUPP_MASK;
++	return (mode == ESPI_SLAVE_IO_MODE_SUPP_SINGLE_QUAD) ||
++		(mode == ESPI_SLAVE_IO_MODE_SUPP_SINGLE_DUAL_QUAD);
++}
++
++static inline bool espi_slave_supports_dual_io(u32 caps)
++{
++	u32 mode = caps & ESPI_SLAVE_IO_MODE_SUPP_MASK;
++	return (mode == ESPI_SLAVE_IO_MODE_SUPP_SINGLE_DUAL) ||
++		(mode == ESPI_SLAVE_IO_MODE_SUPP_SINGLE_DUAL_QUAD);
++}
++
++static inline bool espi_slave_supports_single_io(u32 caps)
++{
++	//As per register spec single IO mode is supported by default 
++	return true;
++}
++
++static inline bool espi_slave_supports_66_mhz(u32 caps)
++{
++	u32 freq = caps & ESPI_SLAVE_OP_FREQ_SUPP_MASK;
++	return freq == ESPI_SLAVE_OP_FREQ_SUPP_66_MHZ;
++}
++
++static inline bool espi_slave_supports_33_mhz(u32 caps)
++{
++	u32 freq = caps & ESPI_SLAVE_OP_FREQ_SUPP_MASK;
++	return freq == ESPI_SLAVE_OP_FREQ_SUPP_33_MHZ;
++}
++
++static inline bool espi_slave_supports_16_mhz(u32 caps)
++{
++	u32 freq = caps & ESPI_SLAVE_OP_FREQ_SUPP_MASK;
++	return freq == ESPI_SLAVE_OP_FREQ_SUPP_16_MHZ;
++}
+-- 
+2.34.1
+

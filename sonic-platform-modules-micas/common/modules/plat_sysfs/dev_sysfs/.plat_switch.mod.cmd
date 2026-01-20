@@ -1,0 +1,1 @@
+cmd_/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_sysfs/plat_switch.mod := printf '%s\n'   plat_switch.o | awk '!x[$$0]++ { print("/sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_sysfs/"$$0) }' > /sonic/platform/broadcom/sonic-platform-modules-micas/common/modules/plat_sysfs/dev_sysfs/plat_switch.mod
